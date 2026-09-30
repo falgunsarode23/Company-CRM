@@ -1,0 +1,36 @@
+import express from 'express';
+import cors from 'cors';
+import Database from 'better-sqlite3';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+
+const app=express(); app.use(cors()); app.use(express.json());
+const db=new Database(process.env.DB_FILE||'crm.db');
+const JWT_SECRET=process.env.JWT_SECRET||'change-this-secret-in-production';
+db.pragma('journal_mode=WAL');
+db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT DEFAULT 'sales',created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,industry TEXT,website TEXT,location TEXT,size TEXT,notes TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY AUTOINCREMENT,company_id INTEGER,name TEXT NOT NULL,title TEXT,email TEXT,phone TEXT,linkedin TEXT,notes TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(company_id) REFERENCES companies(id));
+CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY AUTOINCREMENT,company_id INTEGER,contact_id INTEGER,name TEXT NOT NULL,source TEXT,status TEXT DEFAULT 'New',priority TEXT DEFAULT 'Medium',owner_id INTEGER,value REAL DEFAULT 0,next_followup TEXT,notes TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(company_id) REFERENCES companies(id),FOREIGN KEY(contact_id) REFERENCES contacts(id),FOREIGN KEY(owner_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS activities(id INTEGER PRIMARY KEY AUTOINCREMENT,lead_id INTEGER,company_id INTEGER,user_id INTEGER,type TEXT NOT NULL,subject TEXT,notes TEXT,due_at TEXT,completed INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(lead_id) REFERENCES leads(id),FOREIGN KEY(company_id) REFERENCES companies(id),FOREIGN KEY(user_id) REFERENCES users(id));`);
+if(!db.prepare('SELECT 1 FROM users LIMIT 1').get()) db.prepare('INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)').run('Admin','admin@gennext.local',bcrypt.hashSync('Admin@123',10),'admin');
+function auth(req,res,next){const h=req.headers.authorization||''; try{req.user=jwt.verify(h.replace('Bearer ',''),JWT_SECRET);next()}catch{return res.status(401).json({error:'Unauthorized'})}}
+function rows(sql,p=[]){return db.prepare(sql).all(...p)}
+app.get('/api/health',(req,res)=>res.json({ok:true}));
+app.post('/api/login',(req,res)=>{const u=db.prepare('SELECT * FROM users WHERE email=?').get(req.body.email); if(!u||!bcrypt.compareSync(req.body.password,u.password))return res.status(401).json({error:'Invalid credentials'}); res.json({token:jwt.sign({id:u.id,name:u.name,email:u.email,role:u.role},JWT_SECRET,{expiresIn:'12h'}),user:{id:u.id,name:u.name,email:u.email,role:u.role}})});
+app.get('/api/users',auth,(req,res)=>res.json(rows('SELECT id,name,email,role FROM users ORDER BY name')));
+app.post('/api/users',auth,(req,res)=>{const p=req.body; const r=db.prepare('INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)').run(p.name,p.email,bcrypt.hashSync(p.password||'Temp@123',10),p.role||'sales');res.json({id:r.lastInsertRowid})});
+app.get('/api/companies',auth,(req,res)=>res.json(rows('SELECT * FROM companies ORDER BY name')));
+app.post('/api/companies',auth,(req,res)=>{const p=req.body,r=db.prepare('INSERT INTO companies(name,industry,website,location,size,notes) VALUES(?,?,?,?,?,?)').run(p.name,p.industry,p.website,p.location,p.size,p.notes);res.json({id:r.lastInsertRowid})});
+app.put('/api/companies/:id',auth,(req,res)=>{const p=req.body;db.prepare('UPDATE companies SET name=?,industry=?,website=?,location=?,size=?,notes=? WHERE id=?').run(p.name,p.industry,p.website,p.location,p.size,p.notes,req.params.id);res.json({ok:true})});
+app.get('/api/contacts',auth,(req,res)=>res.json(rows('SELECT c.*,co.name company_name FROM contacts c LEFT JOIN companies co ON co.id=c.company_id ORDER BY c.name')));
+app.post('/api/contacts',auth,(req,res)=>{const p=req.body,r=db.prepare('INSERT INTO contacts(company_id,name,title,email,phone,linkedin,notes) VALUES(?,?,?,?,?,?,?)').run(p.company_id,p.name,p.title,p.email,p.phone,p.linkedin,p.notes);res.json({id:r.lastInsertRowid})});
+app.put('/api/contacts/:id',auth,(req,res)=>{const p=req.body;db.prepare('UPDATE contacts SET company_id=?,name=?,title=?,email=?,phone=?,linkedin=?,notes=? WHERE id=?').run(p.company_id,p.name,p.title,p.email,p.phone,p.linkedin,p.notes,req.params.id);res.json({ok:true})});
+app.get('/api/leads',auth,(req,res)=>res.json(rows(`SELECT l.*,co.name company_name,c.name contact_name,u.name owner_name FROM leads l LEFT JOIN companies co ON co.id=l.company_id LEFT JOIN contacts c ON c.id=l.contact_id LEFT JOIN users u ON u.id=l.owner_id ORDER BY l.updated_at DESC`)));
+app.post('/api/leads',auth,(req,res)=>{const p=req.body,r=db.prepare('INSERT INTO leads(company_id,contact_id,name,source,status,priority,owner_id,value,next_followup,notes) VALUES(?,?,?,?,?,?,?,?,?,?)').run(p.company_id||null,p.contact_id||null,p.name,p.source,p.status||'New',p.priority||'Medium',p.owner_id||req.user.id,Number(p.value)||0,p.next_followup||null,p.notes||'');res.json({id:r.lastInsertRowid})});
+app.put('/api/leads/:id',auth,(req,res)=>{const p=req.body;db.prepare('UPDATE leads SET company_id=?,contact_id=?,name=?,source=?,status=?,priority=?,owner_id=?,value=?,next_followup=?,notes=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(p.company_id||null,p.contact_id||null,p.name,p.source,p.status,p.priority,p.owner_id||null,Number(p.value)||0,p.next_followup||null,p.notes||'',req.params.id);res.json({ok:true})});
+app.get('/api/activities',auth,(req,res)=>res.json(rows(`SELECT a.*,l.name lead_name,co.name company_name,u.name user_name FROM activities a LEFT JOIN leads l ON l.id=a.lead_id LEFT JOIN companies co ON co.id=a.company_id LEFT JOIN users u ON u.id=a.user_id ORDER BY COALESCE(a.due_at,a.created_at) ASC`)));
+app.post('/api/activities',auth,(req,res)=>{const p=req.body,r=db.prepare('INSERT INTO activities(lead_id,company_id,user_id,type,subject,notes,due_at) VALUES(?,?,?,?,?,?,?)').run(p.lead_id||null,p.company_id||null,p.user_id||req.user.id,p.type,p.subject,p.notes,p.due_at||null);res.json({id:r.lastInsertRowid})});
+app.patch('/api/activities/:id',auth,(req,res)=>{db.prepare('UPDATE activities SET completed=? WHERE id=?').run(req.body.completed?1:0,req.params.id);res.json({ok:true})});
+app.get('/api/dashboard',auth,(req,res)=>{const total=db.prepare('SELECT COUNT(*) n FROM leads').get().n;const open=db.prepare("SELECT COUNT(*) n FROM leads WHERE status NOT IN ('Won','Lost')").get().n;const meetings=db.prepare("SELECT COUNT(*) n FROM activities WHERE type='Meeting' AND completed=0").get().n;const overdue=db.prepare("SELECT COUNT(*) n FROM activities WHERE completed=0 AND due_at IS NOT NULL AND datetime(due_at)<datetime('now')").get().n;const pipeline=rows('SELECT status,COUNT(*) count,COALESCE(SUM(value),0) value FROM leads GROUP BY status ORDER BY count DESC');res.json({total,open,meetings,overdue,pipeline})});
+app.listen(process.env.PORT||4000,()=>console.log('CRM API running on http://localhost:'+(process.env.PORT||4000)));
